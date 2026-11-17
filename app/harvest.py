@@ -36,7 +36,7 @@ from .oai import (
     OaiPage,
     parse_datestamp,
 )
-from .store import Store
+from .store import Store, SubjectConflict
 
 
 class HarvestCancelled(Exception):
@@ -45,6 +45,22 @@ class HarvestCancelled(Exception):
 
 class HarvestFailed(Exception):
     pass
+
+
+def describe_conflicts(conflicts: list[dict]) -> str:
+    pieces = []
+    for row in conflicts[:5]:
+        pieces.append(
+            f"《{row.get('title') or row.get('identifier')}》→"
+            f"{'/'.join(row.get('conflict_subjects', []))}"
+        )
+    more = "" if len(conflicts) <= 5 else f" 等 {len(conflicts)} 条"
+    return (
+        "当前主题规则在最高优先级上指向不同主题，整轮失败、未发布"
+        "（目录、主题与水位保持原样，调整规则后可重采）："
+        + "；".join(pieces)
+        + more
+    )
 
 
 class PaginationChanged(Exception):
@@ -341,7 +357,14 @@ class Harvester:
                 complete_list_size=complete_list_size,
                 phase="committing",
             )
-            result = store.commit_run(run_id)
+            try:
+                result = store.commit_run(run_id)
+            except SubjectConflict as exc:
+                # commit_run has already rolled the transaction back:
+                # catalogue, subjects and watermark are untouched.  Finalise
+                # the round as failed so the user can adjust the rules and
+                # re-harvest the same window.
+                raise HarvestFailed(describe_conflicts(exc.args[0])) from exc
             if not result.get("committed"):
                 if not store.is_run_running(run_id):
                     raise HarvestCancelled(

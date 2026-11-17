@@ -16,6 +16,22 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Sequence
 
+from .subjects import Rule, classify_catalog, normalize_rule_input
+
+
+class SubjectConflict(Exception):
+    """Current rules disagree on a title's subject at the highest priority.
+
+    Raised inside a commit transaction so the whole transaction is rolled
+    back: neither catalogue rows, subjects nor the watermark may change while
+    a conflict exists.
+    """
+
+
+# How many classified rows a preview payload carries back (conflicts are
+# always reported in full).
+PREVIEW_ROW_LIMIT = 500
+
 
 def utc_now_millis() -> str:
     return (
@@ -97,16 +113,49 @@ class Store:
                     title TEXT NOT NULL,
                     creator TEXT,
                     source_datestamp TEXT NOT NULL,
-                    harvested_at TEXT NOT NULL
+                    harvested_at TEXT NOT NULL,
+                    subject TEXT
                 );
 
                 CREATE INDEX IF NOT EXISTS idx_catalog_title ON catalog(title);
 
+                CREATE TABLE IF NOT EXISTS subject_rules (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    keyword TEXT NOT NULL,
+                    subject TEXT NOT NULL,
+                    priority INTEGER NOT NULL,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
+
+                CREATE INDEX IF NOT EXISTS idx_subject_rules_priority
+                    ON subject_rules(priority DESC, id);
+
                 INSERT OR IGNORE INTO published_state
                     (id, watermark, updated_at, success_count, last_run_id)
                 VALUES (1, NULL, NULL, 0, NULL);
+
+                -- Monotonic versions backing the preview/confirm optimistic
+                -- concurrency check.  Every rule edit bumps rules_version;
+                -- every successful catalogue publication (harvest commit or
+                -- rule confirmation) bumps catalog_version.
+                INSERT OR IGNORE INTO meta(key, value)
+                VALUES ('subject_rules_version', '0');
+                INSERT OR IGNORE INTO meta(key, value)
+                VALUES ('catalog_version', '0');
                 """
             )
+            self._migrate_catalog_subject()
+
+    def _migrate_catalog_subject(self) -> None:
+        """Add the subject column to databases created before this feature."""
+        with self._lock:
+            columns = {
+                row["name"]
+                for row in self._conn.execute("PRAGMA table_info(catalog)").fetchall()
+            }
+            if "subject" not in columns:
+                self._conn.execute("ALTER TABLE catalog ADD COLUMN subject TEXT")
 
     def _recover_interrupted_runs(self) -> None:
         """A previous process died.  No in-memory task can own these runs."""
@@ -150,6 +199,15 @@ class Store:
                     ON runs(status) WHERE status = 'running'
                 """
             )
+
+    def _safe_rollback(self) -> None:
+        """Roll back if a transaction is active; ignore a missing one.
+
+        Some error paths roll back deliberately and then re-raise into a
+        generic handler that would otherwise issue a second ROLLBACK.
+        """
+        if self._conn.in_transaction:
+            self._conn.execute("ROLLBACK")
 
     # ----------------------------------------------------------------- helpers
     def _meta_get(self, key: str) -> str | None:
@@ -477,6 +535,7 @@ class Store:
                 now = utc_now_millis()
                 upserts = 0
                 deletions = 0
+                touched_identifiers: list[str] = []
                 for row in rows:
                     if row["deleted"]:
                         self._conn.execute(
@@ -489,8 +548,8 @@ class Store:
                             """
                             INSERT INTO catalog
                                 (identifier, title, creator, source_datestamp,
-                                 harvested_at)
-                            VALUES (?, ?, ?, ?, ?)
+                                 harvested_at, subject)
+                            VALUES (?, ?, ?, ?, ?, NULL)
                             ON CONFLICT(identifier) DO UPDATE SET
                                 title = excluded.title,
                                 creator = excluded.creator,
@@ -506,8 +565,22 @@ class Store:
                             ),
                         )
                         upserts += 1
+                        touched_identifiers.append(row["identifier"])
+
+                # Subjects are decided by the rules in force at commit time.
+                # A disagreement at the highest priority fails the whole
+                # round: roll back so catalogue, subjects and watermark stay
+                # exactly as published.
+                rules = self._rules_as_objects()
+                conflicts = self._apply_subjects_locked(
+                    rules, identifiers=touched_identifiers
+                )
+                if conflicts:
+                    self._safe_rollback()
+                    raise SubjectConflict(conflicts)
 
                 watermark = run["window_until"]
+                new_catalog_version = self._bump_meta("catalog_version")
                 self._conn.execute(
                     """
                     UPDATE published_state
@@ -541,7 +614,7 @@ class Store:
                     "watermark": watermark,
                 }
             except BaseException:
-                self._conn.execute("ROLLBACK")
+                self._safe_rollback()
                 raise
 
     def fail_run(self, run_id: str, error: str) -> bool:
@@ -634,7 +707,7 @@ class Store:
             rows = self._conn.execute(
                 f"""
                 SELECT identifier, title, creator, source_datestamp,
-                       harvested_at
+                       harvested_at, subject
                   FROM catalog {where}
                  ORDER BY title COLLATE NOCASE, identifier
                  LIMIT ? OFFSET ?
@@ -648,6 +721,251 @@ class Store:
                 "page_size": page_size,
                 "pages": pages,
                 "query": query,
+            }
+
+    # ------------------------------------------------------------- subject rules
+    def _meta_int(self, key: str) -> int:
+        value = self._meta_get(key)
+        try:
+            return int(value) if value is not None else 0
+        except (TypeError, ValueError):
+            return 0
+
+    def _bump_meta(self, key: str) -> int:
+        value = self._meta_int(key) + 1
+        self._meta_set(key, str(value))
+        return value
+
+    def subject_rules_version(self) -> int:
+        with self._lock:
+            return self._meta_int("subject_rules_version")
+
+    def catalog_version(self) -> int:
+        with self._lock:
+            return self._meta_int("catalog_version")
+
+    def list_subject_rules(self) -> list[dict[str, Any]]:
+        with self._lock:
+            rows = self._conn.execute(
+                """
+                SELECT id, keyword, subject, priority, created_at, updated_at
+                  FROM subject_rules
+                 ORDER BY priority DESC, id
+                """
+            ).fetchall()
+            return [dict(r) for r in rows]
+
+    def _rules_as_objects(self) -> list[Rule]:
+        rows = self._conn.execute(
+            "SELECT id, keyword, subject, priority FROM subject_rules"
+        ).fetchall()
+        return [
+            Rule(
+                id=row["id"],
+                keyword=row["keyword"],
+                subject=row["subject"],
+                priority=row["priority"],
+            )
+            for row in rows
+        ]
+
+    def upsert_subject_rule(
+        self, keyword: str, subject: str, priority: Any, rule_id: int | None = None
+    ) -> dict[str, Any]:
+        """Create or update one rule.  Every edit bumps the rules version."""
+        keyword, subject, priority = normalize_rule_input(keyword, subject, priority)
+        now = utc_now_millis()
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                if rule_id is not None:
+                    cur = self._conn.execute(
+                        """
+                        UPDATE subject_rules
+                           SET keyword = ?, subject = ?, priority = ?,
+                               updated_at = ?
+                         WHERE id = ?
+                        """,
+                        (keyword, subject, priority, now, rule_id),
+                    )
+                    if cur.rowcount == 0:
+                        raise KeyError(rule_id)
+                    new_id = rule_id
+                else:
+                    cur = self._conn.execute(
+                        """
+                        INSERT INTO subject_rules
+                            (keyword, subject, priority, created_at, updated_at)
+                        VALUES (?, ?, ?, ?, ?)
+                        """,
+                        (keyword, subject, priority, now, now),
+                    )
+                    new_id = int(cur.lastrowid)
+                self._bump_meta("subject_rules_version")
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._safe_rollback()
+                raise
+            row = self._conn.execute(
+                "SELECT * FROM subject_rules WHERE id = ?", (new_id,)
+            ).fetchone()
+            return dict(row)
+
+    def delete_subject_rule(self, rule_id: int) -> bool:
+        with self._lock:
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                cur = self._conn.execute(
+                    "DELETE FROM subject_rules WHERE id = ?", (rule_id,)
+                )
+                changed = cur.rowcount > 0
+                if changed:
+                    self._bump_meta("subject_rules_version")
+                self._conn.execute("COMMIT")
+                return changed
+            except BaseException:
+                self._conn.execute("ROLLBACK")
+                raise
+
+    def preview_subject_rules(
+        self, *, limit: int = PREVIEW_ROW_LIMIT
+    ) -> dict[str, Any]:
+        """Dry-run the rules currently in force against the published catalogue.
+
+        Nothing is written.  Conflicts are reported in full; the row preview
+        is capped at ``limit`` rows (conflict rows first, then ordinary rows).
+        """
+        with self._lock:
+            rules = self._rules_as_objects()
+            rows = self._conn.execute(
+                """
+                SELECT identifier, title, creator, source_datestamp,
+                       harvested_at, subject AS current_subject
+                  FROM catalog
+                 ORDER BY title COLLATE NOCASE, identifier
+                """
+            ).fetchall()
+            classified = classify_catalog([dict(r) for r in rows], rules)
+
+        conflicts = [row for row in classified if row["conflict"]]
+        changed = [
+            row
+            for row in classified
+            if not row["conflict"]
+            and (row["subject"] or None) != (row.get("current_subject") or None)
+        ]
+        assigned = [row for row in classified if row["subject"]]
+        conflicts.sort(key=lambda r: r["title"])
+        changed.sort(key=lambda r: r["title"])
+        preview_rows = (conflicts + changed)[:limit]
+        return {
+            "rules_version": self.subject_rules_version(),
+            "catalog_version": self.catalog_version(),
+            "rules": self.list_subject_rules(),
+            "catalog_size": len(classified),
+            "conflict_count": len(conflicts),
+            "would_change_count": len(changed),
+            "assigned_count": len(assigned),
+            "conflicts": conflicts,
+            "changes": [
+                {
+                    "identifier": row["identifier"],
+                    "title": row["title"],
+                    "current_subject": row.get("current_subject"),
+                    "subject": row["subject"],
+                    "matched_rule_ids": row["matched_rule_ids"],
+                }
+                for row in changed
+            ],
+            "preview_rows": preview_rows,
+        }
+
+    def _apply_subjects_locked(
+        self, rules: list[Rule], *, identifiers: Sequence[str] | None = None
+    ) -> list[dict[str, Any]]:
+        """Recompute subjects inside an already-open IMMEDIATE transaction.
+
+        When ``identifiers`` is given only those catalogue rows are
+        reclassified (used by a harvest commit, which has just upserted or
+        deleted them); otherwise the whole catalogue is reclassified (rule
+        confirmation).  Returns the conflict rows.  On conflict the caller is
+        expected to roll the outer transaction back.
+        """
+        if identifiers is not None:
+            if not identifiers:
+                # An empty window (no upserts, no deletions) has nothing to
+                # reclassify; the watermark still advances in the caller.
+                return []
+            placeholders = ",".join("?" for _ in identifiers)
+            sql = (
+                "SELECT identifier, title FROM catalog "
+                f"WHERE identifier IN ({placeholders})"
+            )
+            rows = self._conn.execute(sql, list(identifiers)).fetchall()
+        else:
+            rows = self._conn.execute(
+                "SELECT identifier, title FROM catalog"
+            ).fetchall()
+        classified = classify_catalog([dict(r) for r in rows], rules)
+        conflicts = [row for row in classified if row["conflict"]]
+        if conflicts:
+            return conflicts
+        for row in classified:
+            self._conn.execute(
+                "UPDATE catalog SET subject = ? WHERE identifier = ?",
+                (row["subject"], row["identifier"]),
+            )
+        return []
+
+    def confirm_subject_rules(
+        self, *, rules_version: int, catalog_version: int
+    ) -> dict[str, Any]:
+        """Publish the subjects implied by the current rules.
+
+        Optimistic concurrency: a confirmation is only accepted when neither
+        the rules nor the catalogue has changed since the preview the user is
+        confirming.  A conflict also rejects the confirmation without touching
+        anything.  On success the catalogue version advances.
+        """
+        with self._lock:
+            current_rules_version = self._meta_int("subject_rules_version")
+            current_catalog_version = self._meta_int("catalog_version")
+            if (
+                current_rules_version != rules_version
+                or current_catalog_version != catalog_version
+            ):
+                return {
+                    "confirmed": False,
+                    "reason": "stale",
+                    "rules_version": current_rules_version,
+                    "catalog_version": current_catalog_version,
+                }
+            self._conn.execute("BEGIN IMMEDIATE")
+            try:
+                rules = self._rules_as_objects()
+                conflicts = self._apply_subjects_locked(rules)
+                if conflicts:
+                    self._conn.execute("ROLLBACK")
+                    return {
+                        "confirmed": False,
+                        "reason": "conflict",
+                        "conflicts": conflicts,
+                        "rules_version": current_rules_version,
+                        "catalog_version": current_catalog_version,
+                    }
+                new_catalog_version = self._bump_meta("catalog_version")
+                self._conn.execute(
+                    "UPDATE published_state SET updated_at = ? WHERE id = 1",
+                    (utc_now_millis(),),
+                )
+                self._conn.execute("COMMIT")
+            except BaseException:
+                self._safe_rollback()
+                raise
+            return {
+                "confirmed": True,
+                "catalog_version": new_catalog_version,
+                "rules_version": current_rules_version,
             }
 
     def close(self) -> None:

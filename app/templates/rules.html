@@ -1,0 +1,162 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>主题规则</title>
+<link rel="stylesheet" href="/static/style.css">
+<noscript><style>.nojs-only{display:inline !important}</style></noscript>
+<style>.nojs-only{display:none}</style>
+</head>
+<body>
+<header class="topbar">
+  <div>
+    <h1>主题规则</h1>
+    <p class="sub">按标题关键词分配主题 · 整数优先级 · 预览影响后确认才改变已发布主题</p>
+  </div>
+  <nav>
+    <a href="/">目录</a>
+    <a href="/rules">主题规则</a>
+    <a href="/runs">轮次记录</a>
+    <a href="/status">状态 JSON</a>
+  </nav>
+</header>
+
+{% if message %}<div class="flash" style="margin-bottom:0">{{ message }}</div>{% endif %}
+<div id="rule-message" class="flash" style="margin-bottom:0"></div>
+
+<main class="layout" style="grid-template-columns:minmax(340px,420px) minmax(0,1fr)">
+  <!-- ============================================================ rule editor -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>规则列表</h2>
+      <button class="primary" id="btn-new-rule" type="button">新增规则</button>
+    </div>
+    <p class="hint">命中规则按整数优先级取最高者；同优先级指向不同主题即为
+      <strong>冲突</strong>，确认与采集都会被拒绝。未命中任何规则的标题主题留空。</p>
+
+    <table class="records" id="rules-table">
+      <thead>
+        <tr><th>关键词</th><th>主题名</th><th>优先级</th><th>操作</th></tr>
+      </thead>
+      <tbody>
+      {% for rule in rules %}
+        <tr class="rule-row" data-rule-id="{{ rule.id }}"
+            data-keyword="{{ rule.keyword|e }}" data-subject="{{ rule.subject|e }}"
+            data-priority="{{ rule.priority }}">
+          <td>{{ rule.keyword }}</td>
+          <td>{{ rule.subject }}</td>
+          <td class="mono">{{ rule.priority }}</td>
+          <td class="rule-actions">
+            <button type="button" class="ghost js-edit">修改</button>
+            <form method="post" action="/rules/{{ rule.id }}/delete" class="nojs-only">
+              <button type="submit" class="danger">删除</button>
+            </form>
+            <button type="button" class="danger js-delete">删除</button>
+          </td>
+        </tr>
+      {% else %}
+        <tr><td colspan="4" class="empty">还没有规则。新增规则后可预览对已发布书目的影响。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <noscript>
+      <h3>新增 / 修改规则（无脚本模式）</h3>
+      <form class="rule-form" method="post" action="/rules/save">
+        <input type="hidden" name="id" value="">
+        <label>标题关键词</label>
+        <input name="keyword" required maxlength="200" placeholder="如：数据治理">
+        <label>主题名</label>
+        <input name="subject" required maxlength="200" placeholder="如：图书馆管理">
+        <label>优先级（整数，越大越优先）</label>
+        <input name="priority" required type="number" step="1" placeholder="如：100">
+        <div class="actions"><button class="primary" type="submit">保存规则</button></div>
+      </form>
+    </noscript>
+  </section>
+
+  <!-- ================================================================ preview -->
+  <section class="panel">
+    <div class="panel-head">
+      <h2>对已发布书目的影响预览</h2>
+      <span class="hint mono" id="version-stamp">
+        规则版本 v{{ preview.rules_version }} · 目录版本 v{{ preview.catalog_version }}
+      </span>
+    </div>
+
+    <div class="preview-summary" id="preview-summary">
+      <div class="chip"><span class="label">目录条数</span><strong id="sum-total">{{ preview.catalog_size }}</strong></div>
+      <div class="chip ok"><span class="label">将有主题</span><strong id="sum-assigned">{{ preview.assigned_count }}</strong></div>
+      <div class="chip"><span class="label">主题将变化</span><strong id="sum-changed">{{ preview.would_change_count }}</strong></div>
+      <div class="chip danger"><span class="label">冲突</span><strong id="sum-conflicts">{{ preview.conflict_count }}</strong></div>
+    </div>
+
+    <div id="conflict-box" {% if not preview.conflict_count %}hidden{% endif %}>
+      <h3>冲突标题（最高优先级对应多个主题，确认与采集都会被拒绝）</h3>
+      <table class="records" id="conflicts-table">
+        <thead><tr><th>标题</th><th>候选主题</th><th>命中规则</th></tr></thead>
+        <tbody>
+        {% for row in preview.conflicts %}
+          <tr>
+            <td>{{ row.title }}</td>
+            <td>{% for s in row.conflict_subjects %}<span class="conflict-tag">{{ s }}</span> {% endfor %}</td>
+            <td class="mono small">{{ row.matched_rule_ids | join(", ") }}</td>
+          </tr>
+        {% endfor %}
+        </tbody>
+      </table>
+    </div>
+
+    <h3>主题将变化的书目{% if preview.preview_rows|length > preview.would_change_count %}
+      （仅展示前 {{ preview.preview_rows|length }} 行，冲突与变化优先）{% endif %}</h3>
+    <table class="records" id="changes-table">
+      <thead>
+        <tr><th>标识</th><th>标题</th><th>当前主题</th><th>确认后主题</th><th>命中规则</th></tr>
+      </thead>
+      <tbody>
+      {% for row in preview.changes %}
+        <tr>
+          <td class="mono small">{{ row.identifier }}</td>
+          <td>{{ row.title }}</td>
+          <td>{% if row.current_subject %}{{ row.current_subject }}{% else %}<span class="muted">（空）</span>{% endif %}</td>
+          <td><span class="subject-tag">{{ row.subject }}</span></td>
+          <td class="mono small">{{ row.matched_rule_ids | join(", ") }}</td>
+        </tr>
+      {% else %}
+        <tr><td colspan="5" class="empty">没有主题会发生变化。</td></tr>
+      {% endfor %}
+      </tbody>
+    </table>
+
+    <div class="sticky-confirm">
+      <button class="primary" id="btn-confirm" type="button"
+              {% if preview.conflict_count %}disabled title="存在冲突，须先调整规则"{% endif %}>
+        确认并应用到已发布目录
+      </button>
+      <span class="hint">确认只在规则与目录均未变化时生效；若预览后有变化，将拒绝旧确认并展示当前结果。</span>
+    </div>
+  </section>
+</main>
+
+<!-- edit dialog (JS only) -->
+<dialog id="rule-dialog" class="dialog">
+  <form class="rule-form" id="rule-form" method="dialog">
+    <h3 id="dialog-title">新增规则</h3>
+    <input type="hidden" name="id" id="f-id">
+    <label>标题关键词（按包含匹配，不区分大小写）</label>
+    <input name="keyword" id="f-keyword" required maxlength="200" placeholder="如：数据治理">
+    <label>主题名</label>
+    <input name="subject" id="f-subject" required maxlength="200" placeholder="如：图书馆管理">
+    <label>优先级（整数，越大越优先）</label>
+    <input name="priority" id="f-priority" required type="number" step="1" placeholder="如：100">
+    <div class="dialog-actions">
+      <button type="button" id="dialog-cancel" class="ghost">取消</button>
+      <button type="submit" class="primary" id="dialog-save">保存</button>
+    </div>
+  </form>
+</dialog>
+
+<script src="/static/rules.js" defer></script>
+</body>
+</html>

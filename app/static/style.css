@@ -105,3 +105,42 @@ button:disabled { opacity: .55; cursor: not-allowed; }
 .muted { color: var(--muted); }
 .pager { display: flex; gap: 16px; align-items: center; justify-content: center; padding: 14px 0 2px; font-size: 14px; }
 pre { white-space: pre-wrap; word-break: break-word; font-size: 12.5px; background: #f8fafc; padding: 14px; border-radius: 8px; }
+
+.subject-tag {
+  display: inline-block; padding: 1px 9px; border-radius: 20px;
+  font-size: 12px; background: #e8f0fe; color: #1d56b5; white-space: nowrap;
+}
+.conflict-tag {
+  display: inline-block; padding: 1px 9px; border-radius: 20px;
+  font-size: 12px; background: #fdecea; color: var(--danger); white-space: nowrap;
+}
+.rules-layout { display: grid; grid-template-columns: minmax(0, 380px) minmax(0, 1fr); gap: 18px; align-items: start; }
+@media (max-width: 1000px) { .rules-layout { grid-template-columns: 1fr; } }
+.rule-form label { display: block; font-size: 12px; color: var(--muted); margin: 10px 0 3px; }
+.rule-form input { width: 100%; padding: 8px 10px; border: 1px solid var(--line); border-radius: 7px; font: inherit; }
+.rule-row .rule-actions { display: flex; gap: 6px; flex-wrap: wrap; }
+.rule-row button { padding: 4px 10px; font-size: 12.5px; }
+button.ghost { background: #f8fafc; }
+.preview-summary { display: flex; gap: 10px; flex-wrap: wrap; margin: 6px 0 14px; }
+.preview-summary .chip {
+  background: #f8fafc; border: 1px solid var(--line); border-radius: 8px;
+  padding: 8px 12px; font-size: 13px;
+}
+.preview-summary .chip strong { font-size: 15px; }
+.preview-summary .chip.danger { background: #fdecea; border-color: #e3b3ad; color: var(--danger); }
+.preview-summary .chip.ok { background: #e3f5ea; border-color: #bfe3cd; color: var(--ok); }
+.sticky-confirm { position: sticky; bottom: 12px; margin-top: 14px; }
+#rule-message { display: none; }
+#rule-message.show { display: block; }
+#rule-message.error { background: #fdecea; border-color: #e3b3ad; color: #7a1f16; }
+#rule-message.success { background: #e3f5ea; border-color: #bfe3cd; color: #1c5e38; }
+.dialog-backdrop {
+  position: fixed; inset: 0; background: rgba(15, 23, 42, .45);
+  display: flex; align-items: center; justify-content: center; z-index: 20;
+}
+.dialog {
+  background: #fff; border-radius: 12px; padding: 22px; width: min(560px, 92vw);
+  max-height: 84vh; overflow: auto; box-shadow: 0 18px 50px rgba(0, 0, 0, .25);
+}
+.dialog h3 { margin-top: 0; }
+.dialog .dialog-actions { display: flex; justify-content: flex-end; gap: 10px; margin-top: 16px; }
